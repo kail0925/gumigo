@@ -1,6 +1,61 @@
 import pygame
 import math
 import random
+import socket
+import threading
+import time
+import sys
+
+# === [네트워크] 통신 시스템 ===
+SERVER_IP = '127.0.0.1' 
+SERVER_PORT = 5555
+my_id = 0
+other_pos = {"x": -10.0, "y": -10.0}
+
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
+    s.connect((SERVER_IP, SERVER_PORT))
+    my_id = int(s.recv(1024).decode('utf-8').strip())
+    print(f"접속 성공! 나는 {my_id}P 입니다.")
+except Exception as e:
+    print("서버에 연결할 수 없습니다! 싱글 플레이로 진행합니다.")
+
+def receive_data():
+    global other_pos
+    while True:
+        try:
+            # ⭐️ 버그 해결 1: player_x가 없어도 무조건 기본값(0)을 보내서 통신 멈춤(데드락) 방지
+            px = player_x / 64 if 'player_x' in globals() else 0.0
+            py = player_y / 64 if 'player_y' in globals() else 0.0
+            
+            msg = f"{px},{py}\n"
+            s.sendall(msg.encode('utf-8'))
+
+            data = s.recv(1024).decode('utf-8')
+            if not data: break
+            
+            msgs = data.strip().split('\n')
+            if msgs and msgs[-1]:
+                latest = msgs[-1].split('|')
+                if len(latest) >= 2:
+                    p1_x, p1_y = map(float, latest[0].split(','))
+                    p2_x, p2_y = map(float, latest[1].split(','))
+                    if my_id == 1:
+                        other_pos["x"], other_pos["y"] = p2_x * 64, p2_y * 64
+                    else:
+                        other_pos["x"], other_pos["y"] = p1_x * 64, p1_y * 64
+        except Exception as e:
+            pass # 통신이 살짝 끊겨도 스레드가 죽지 않고 계속 시도하도록 보호
+        time.sleep(0.01)
+
+threading.Thread(target=receive_data, daemon=True).start()
+
+# 상대방 모습 (파란색 동그라미 스프라이트)
+other_player_surf = pygame.Surface((64, 64), pygame.SRCALPHA)
+pygame.draw.circle(other_player_surf, (0, 0, 255), (32, 32), 25)
+pygame.draw.circle(other_player_surf, (255, 255, 255), (22, 22), 8)
+pygame.draw.circle(other_player_surf, (255, 255, 255), (42, 22), 8)
+# ==========================================================
 
 # --- 초기화 및 기본 설정 ---
 pygame.init()
@@ -11,15 +66,13 @@ GO_FONT = pygame.font.SysFont('malgungothic', 100, bold=True)
 DMG_FONT = pygame.font.SysFont('malgungothic', 24, bold=True)
 ITEM_FONT = pygame.font.SysFont('malgungothic', 20, bold=True)
 
-# 렌더링 해상도 (비율 고정용)
 WIDTH, HEIGHT = 800, 600
 
-# 현재 창 크기 설정
 infoObject = pygame.display.Info()
 current_win_size = (WIDTH, HEIGHT)
 screen = pygame.display.set_mode(current_win_size, pygame.RESIZABLE)
 virtual_screen = pygame.Surface((WIDTH, HEIGHT))
-pygame.display.set_caption("Pygame Retro FPS - Fixed Aspect Ratio & Speed")
+pygame.display.set_caption("Pygame Retro FPS - Multiplayer Sync")
 clock = pygame.time.Clock()
 
 pygame.mouse.set_visible(False)
@@ -52,7 +105,7 @@ STATE_PAUSED = 2
 WEAPON_PISTOL = 0
 WEAPON_AK = 1
 
-# --- 배경 그라데이션 렌더링 ---
+# --- 배경 그라데이션 ---
 bg_h = HEIGHT * 2
 bg_surface = pygame.Surface((WIDTH, bg_h))
 horizon_y = bg_h // 2
@@ -122,7 +175,6 @@ current_proj_dist = (WIDTH / 2) / math.tan(BASE_FOV / 2)
 
 Z_BUFFER = [MAX_DEPTH] * CASTED_RAYS
 
-# 🚀 UI 컴포넌트 좌표 재배치 (글자와 겹치지 않게 수정)
 sens_minus_btn_rect = pygame.Rect(WIDTH//2 - 120, 220, 50, 40)
 sens_plus_btn_rect = pygame.Rect(WIDTH//2 + 70, 220, 50, 40)
 sens_reset_btn_rect = pygame.Rect(WIDTH//2 - 60, 270, 120, 40)
@@ -136,7 +188,6 @@ def get_virtual_mouse_pos(mouse_x, mouse_y):
     scaled_w, scaled_h = int(WIDTH * ratio), int(HEIGHT * ratio)
     offset_x = (win_w - scaled_w) // 2
     offset_y = (win_h - scaled_h) // 2
-    
     v_x = (mouse_x - offset_x) / ratio
     v_y = (mouse_y - offset_y) / ratio
     return (v_x, v_y)
@@ -178,6 +229,7 @@ def init_game():
     items = []
     Z_BUFFER = [MAX_DEPTH] * CASTED_RAYS
 
+    random.seed(777)
     generate_random_map(24, 24)
     spawn_enemies(12)
 
@@ -197,7 +249,15 @@ def generate_random_map(w, h):
         for dx in range(-1, 2):
             MAP[cy + dy][cx + dx] = 0
             
-    player_x = cx * TILE_SIZE + TILE_SIZE // 2
+    # 맵은 1P, 2P 완전히 동일하게 생성
+    MAP[cy][cx + 1] = 0 
+    
+    # 스폰 위치만 겹치지 않게 나눔
+    if my_id == 2:
+        player_x = (cx + 1) * TILE_SIZE + TILE_SIZE // 2
+    else:
+        player_x = cx * TILE_SIZE + TILE_SIZE // 2
+        
     player_y = cy * TILE_SIZE + TILE_SIZE // 2
 
 def spawn_enemies(count):
@@ -206,8 +266,13 @@ def spawn_enemies(count):
         for attempts in range(50):
             gx = random.randint(1, MAP_W-2)
             gy = random.randint(1, MAP_H-2)
-            dist_to_p = math.hypot(gx*TILE_SIZE - player_x, gy*TILE_SIZE - player_y)
-            if MAP[gy][gx] == 0 and dist_to_p > 300:
+            
+            # ⭐️ 버그 해결 2: 플레이어 위치 대신 맵의 정중앙을 기준으로 몬스터 배치 계산
+            # 이렇게 해야 1P와 2P의 뽑기(Random) 순서가 어긋나지 않고 똑같은 몬스터가 똑같은 위치에 나옴!
+            cx, cy = MAP_W // 2, MAP_H // 2
+            dist_to_center = math.hypot(gx - cx, gy - cy)
+            
+            if MAP[gy][gx] == 0 and dist_to_center > 4:
                 enemies.append({
                     'x': gx * TILE_SIZE + TILE_SIZE//2,
                     'y': gy * TILE_SIZE + TILE_SIZE//2,
@@ -245,7 +310,6 @@ def is_safe(target_x, target_y):
 def start_reload():
     global is_reloading, reload_end
     if is_reloading: return
-    
     if current_weapon == WEAPON_PISTOL and current_pistol_ammo < max_pistol_ammo:
         is_reloading = True
         reload_end = pygame.time.get_ticks() + 1500
@@ -256,7 +320,6 @@ def start_reload():
 def shoot():
     global is_shooting, shoot_timer, gun_recoil, current_score, damage_texts
     global current_pistol_ammo, current_ak_ammo, fire_cooldown_end, items
-    
     current_time = pygame.time.get_ticks()
     
     if player_dead or is_reloading or game_state != STATE_PLAYING: return
@@ -292,10 +355,8 @@ def shoot():
             wall_height = (TILE_SIZE * current_proj_dist) / safe_dist
             sprite_height = wall_height * 0.7
             sprite_width = sprite_height * 0.5
-            
             monster_bottom = HEIGHT // 2 + wall_height // 2 + player_pitch
             monster_top = monster_bottom - sprite_height
-            
             pixel_offset = (angle_diff / (current_fov / 2)) * (WIDTH / 2)
             hit_y = HEIGHT // 2
             
@@ -309,27 +370,20 @@ def shoot():
         distance_ratio = min(min_dist / max_dmg_dist, 1.0)
         damage_multiplier = 1.0 - (0.8 * distance_ratio) 
         final_base_damage = base_damage * damage_multiplier
-        
         damage = int(final_base_damage * 1.5) if is_headshot else int(final_base_damage)
         target_enemy['hp'] -= damage
-        
         offset_x, offset_y = random.randint(-30, 30), random.randint(-30, 0)
         damage_texts.append({'text': f"{damage}", 'x': WIDTH // 2 + offset_x, 'y': HEIGHT // 2 + offset_y, 'color': YELLOW if is_headshot else WHITE, 'life': 45})
         
         if target_enemy['hp'] <= 0:
             target_enemy['dead'] = True
             current_score += 200 if is_headshot else 100
-            
-            drop_x = target_enemy['x'] + random.randint(-10, 10)
-            drop_y = target_enemy['y'] + random.randint(-10, 10)
-            
+            drop_x, drop_y = target_enemy['x'] + random.randint(-10, 10), target_enemy['y'] + random.randint(-10, 10)
             rand_val = random.random()
             if not has_ak: 
-                # AK가 없을 때: AK 무기 30%, 체력 30% 드롭
                 if rand_val < 0.30: items.append({'x': drop_x, 'y': drop_y, 'type': 'ak'})
                 elif rand_val < 0.60: items.append({'x': drop_x, 'y': drop_y, 'type': 'health'})
             else: 
-                # 🚀 총알 아이템 드롭률 대폭 상향: 총알 50%, 체력 30% 드롭
                 if rand_val < 0.50: items.append({'x': drop_x, 'y': drop_y, 'type': 'ammo'})
                 elif rand_val < 0.80: items.append({'x': drop_x, 'y': drop_y, 'type': 'health'})
     else:
@@ -345,20 +399,14 @@ def draw_wall(ray, depth, angle):
     safe_depth = max(1.0, depth) 
     wall_height = (TILE_SIZE * current_proj_dist) / safe_depth
     wall_height = min(wall_height, HEIGHT * 4) 
-    
     fog_ratio = min(1.0, safe_depth / MAX_DEPTH)
     intensity = max(0.0, 1.0 - fog_ratio)
-    
     r = int(DOOM_WALL_BASE[0] * intensity + FOG_COLOR[0] * (1 - intensity))
     g = int(DOOM_WALL_BASE[1] * intensity + FOG_COLOR[1] * (1 - intensity))
     b = int(DOOM_WALL_BASE[2] * intensity + FOG_COLOR[2] * (1 - intensity))
-    
     y_start = HEIGHT // 2 - wall_height // 2 + player_pitch
-    
     rect_x = int(ray * SCALE)
-    next_x = int((ray + 1) * SCALE) 
-    rect_w = next_x - rect_x
-    
+    rect_w = int((ray + 1) * SCALE) - rect_x
     pygame.draw.rect(virtual_screen, (r, g, b), (rect_x, y_start, rect_w, wall_height))
     Z_BUFFER[ray] = depth
 
@@ -369,6 +417,11 @@ def draw_items_and_enemies():
     for enemy in enemies:
         if not enemy['dead']:
             render_list.append({'type': 'enemy', 'obj': enemy, 'dist': math.hypot(enemy['x']-player_x, enemy['y']-player_y)})
+            
+    if other_pos["x"] >= 0 and other_pos["y"] >= 0:
+        dist_to_other = math.hypot(other_pos["x"] - player_x, other_pos["y"] - player_y)
+        if dist_to_other > 5:
+            render_list.append({'type': 'other_player', 'obj': {'x': other_pos["x"], 'y': other_pos["y"]}, 'dist': dist_to_other})
             
     render_list.sort(key=lambda x: x['dist'], reverse=True)
     
@@ -392,7 +445,19 @@ def draw_items_and_enemies():
                 fog_ratio = min(1.0, dist / MAX_DEPTH)
                 intensity = max(0.0, 1.0 - fog_ratio)
                 
-                if entity['type'] == 'enemy':
+                if entity['type'] == 'other_player':
+                    sprite_height = wall_height * 0.7
+                    sprite_width = sprite_height
+                    player_bottom = HEIGHT // 2 + wall_height // 2 + player_pitch
+                    player_top = player_bottom - sprite_height
+                    
+                    scaled_surf = pygame.transform.scale(other_player_surf, (int(sprite_width), int(sprite_height)))
+                    darken = pygame.Surface(scaled_surf.get_size(), pygame.SRCALPHA)
+                    darken.fill((0, 0, 0, int(255 * (1 - intensity))))
+                    scaled_surf.blit(darken, (0, 0), special_flags=pygame.BLEND_RGBA_SUB)
+                    virtual_screen.blit(scaled_surf, (screen_x - sprite_width // 2, player_top))
+                
+                elif entity['type'] == 'enemy':
                     sprite_height = wall_height * 0.7
                     sprite_width = sprite_height * 0.5
                     monster_bottom = HEIGHT // 2 + wall_height // 2 + player_pitch
@@ -440,13 +505,11 @@ def draw_bullet_holes():
         if hole['life'] <= 0:
             bullet_holes.remove(hole)
             continue
-            
         dx, dy = hole['x'] - player_x, hole['y'] - player_y
         dist = math.hypot(dx, dy)
         angle_diff = math.atan2(dy, dx) - player_angle
         while angle_diff < -math.pi: angle_diff += 2 * math.pi
         while angle_diff > math.pi: angle_diff -= 2 * math.pi
-        
         if abs(angle_diff) < current_fov / 2:
             screen_x = (WIDTH / 2) + (angle_diff / (current_fov / 2)) * (WIDTH / 2)
             ray_idx = int(screen_x / SCALE)
@@ -471,7 +534,6 @@ def draw_damage_texts():
 def draw_weapon():
     global gun_recoil
     gun_base_pos = HEIGHT + 250 if is_reloading else HEIGHT + 80 + gun_recoil
-    
     if current_weapon == WEAPON_PISTOL:
         pygame.draw.rect(virtual_screen, (80, 80, 80), (WIDTH // 2 - 40, gun_base_pos - 150, 80, 150))
         pygame.draw.rect(virtual_screen, (40, 40, 40), (WIDTH // 2 - 20, gun_base_pos - 220, 40, 100))
@@ -481,12 +543,10 @@ def draw_weapon():
         pygame.draw.rect(virtual_screen, (30, 30, 30), (WIDTH // 2 - 25, gun_base_pos - 300, 50, 180))
         pygame.draw.rect(virtual_screen, BROWN, (WIDTH // 2 - 25, gun_base_pos - 200, 50, 60))
         pygame.draw.circle(virtual_screen, BLACK, (WIDTH // 2, gun_base_pos - 300), 15)
-
     if is_shooting and shoot_timer > 4 and not is_reloading:
         flash_y = gun_base_pos - 230 if current_weapon == WEAPON_PISTOL else gun_base_pos - 320
         pygame.draw.circle(virtual_screen, (255, 200, 50), (WIDTH // 2, flash_y), 30 if current_weapon == WEAPON_AK else 25)
         pygame.draw.circle(virtual_screen, (255, 100, 0), (WIDTH // 2, flash_y), 15 if current_weapon == WEAPON_AK else 12)  
-
     if game_state == STATE_PLAYING:
         gun_recoil = max(0, gun_recoil - (10 if current_weapon == WEAPON_AK else 5))
 
@@ -494,7 +554,6 @@ def draw_minimap():
     margin, tile_size = 20, 5  
     map_w, map_h = MAP_W * tile_size, MAP_H * tile_size
     start_x, start_y = WIDTH - map_w - margin, margin 
-    
     minimap_surf = pygame.Surface((map_w, map_h), pygame.SRCALPHA)
     minimap_surf.fill((0, 0, 0, 150))
     virtual_screen.blit(minimap_surf, (start_x, start_y))
@@ -506,7 +565,6 @@ def draw_minimap():
                 
     p_map_x, p_map_y = int((player_x / TILE_SIZE) * tile_size), int((player_y / TILE_SIZE) * tile_size)
     pygame.draw.circle(virtual_screen, GREEN, (start_x + p_map_x, start_y + p_map_y), tile_size // 2)
-    
     view_x = p_map_x + math.cos(player_angle) * (tile_size * 2)
     view_y = p_map_y + math.sin(player_angle) * (tile_size * 2)
     pygame.draw.line(virtual_screen, GREEN, (start_x + p_map_x, start_y + p_map_y), (start_x + view_x, start_y + view_y), 1)
@@ -520,6 +578,11 @@ def draw_minimap():
         i_map_x, i_map_y = int((item['x'] / TILE_SIZE) * tile_size), int((item['y'] / TILE_SIZE) * tile_size)
         color = YELLOW if item['type'] == 'ak' else RED if item['type'] == 'ammo' else GREEN
         pygame.draw.circle(virtual_screen, color, (start_x + i_map_x, start_y + i_map_y), max(1, tile_size // 3))
+        
+    if other_pos["x"] >= 0 and other_pos["y"] >= 0:
+        op_map_x = int((other_pos["x"] / TILE_SIZE) * tile_size)
+        op_map_y = int((other_pos["y"] / TILE_SIZE) * tile_size)
+        pygame.draw.circle(virtual_screen, (0, 0, 255), (start_x + op_map_x, start_y + op_map_y), max(1, tile_size // 2))
 
 def draw_ui():
     global heal_message
@@ -564,14 +627,11 @@ def draw_ui():
         virtual_screen.blit(heal_msg, (150, HEIGHT - 80 - (40 - heal_effect_timer)))
 
 # ==========================================
-# --- 메인 게임 루프 ---
-# ==========================================
 init_game()
 
 while True:
     keys = pygame.key.get_pressed()
     current_time = pygame.time.get_ticks()
-    
     is_aiming = pygame.mouse.get_pressed()[2] and not is_reloading and not player_dead
     
     target_fov = (math.pi / 6) if is_aiming else BASE_FOV
@@ -580,25 +640,20 @@ while True:
     current_proj_dist = (WIDTH / 2) / math.tan(current_fov / 2)
     
     for event in pygame.event.get():
-        if event.type == pygame.QUIT:
-            pygame.quit(); exit()
-            
+        if event.type == pygame.QUIT: pygame.quit(); exit()
         if event.type == pygame.VIDEORESIZE and not is_fullscreen:
             current_win_size = (event.w, event.h)
             screen = pygame.display.set_mode(current_win_size, pygame.RESIZABLE)
             
         if game_state == STATE_GAMEOVER:
             if event.type == pygame.KEYDOWN:
-                init_game()
-                pygame.mouse.get_rel(); pygame.event.set_grab(True); pygame.mouse.set_visible(False)
+                init_game(); pygame.mouse.get_rel(); pygame.event.set_grab(True); pygame.mouse.set_visible(False)
         
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             if game_state == STATE_PLAYING and not player_dead:
                 if current_weapon == WEAPON_PISTOL: shoot()
             elif game_state == STATE_PAUSED:
-                mouse_x, mouse_y = pygame.mouse.get_pos()
-                virtual_mouse_pos = get_virtual_mouse_pos(mouse_x, mouse_y)
-                
+                virtual_mouse_pos = get_virtual_mouse_pos(*pygame.mouse.get_pos())
                 if sens_minus_btn_rect.collidepoint(virtual_mouse_pos): sens_mult = max(0.1, sens_mult - 0.1)
                 elif sens_plus_btn_rect.collidepoint(virtual_mouse_pos): sens_mult = min(3.0, sens_mult + 0.1)
                 elif sens_reset_btn_rect.collidepoint(virtual_mouse_pos): sens_mult = 1.0  
@@ -611,12 +666,8 @@ while True:
         elif event.type == pygame.KEYDOWN:
             if event.key == pygame.K_F11:
                 is_fullscreen = not is_fullscreen
-                if is_fullscreen:
-                    screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
-                    current_win_size = screen.get_size()
-                else:
-                    current_win_size = (800, 600)
-                    screen = pygame.display.set_mode(current_win_size, pygame.RESIZABLE)
+                if is_fullscreen: screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN); current_win_size = screen.get_size()
+                else: current_win_size = (800, 600); screen = pygame.display.set_mode(current_win_size, pygame.RESIZABLE)
             if event.key == pygame.K_ESCAPE:
                 if game_state == STATE_PLAYING: game_state = STATE_PAUSED; pygame.mouse.set_visible(True); pygame.event.set_grab(False)
                 elif game_state == STATE_PAUSED: game_state = STATE_PLAYING; pygame.mouse.set_visible(False); pygame.event.set_grab(True); pygame.mouse.get_rel()
@@ -628,7 +679,6 @@ while True:
 
     if game_state == STATE_PLAYING:
         if current_weapon == WEAPON_AK and pygame.mouse.get_pressed()[0] and not player_dead: shoot()
-
         if heal_effect_timer > 0: heal_effect_timer -= 1
         if damage_flash_timer > 0: damage_flash_timer -= 1
             
@@ -644,9 +694,7 @@ while True:
         spawn_amount = min(5, 2 + (current_score // 1000))            
         spawn_delay = max(40, 120 - (current_score // 200) * 4)       
         
-        alive_enemies_count = sum(1 for e in enemies if not e['dead'])
-        
-        if alive_enemies_count < target_max_enemies:
+        if sum(1 for e in enemies if not e['dead']) < target_max_enemies:
             spawn_timer += 1
             if spawn_timer > spawn_delay: 
                 spawn_enemies(spawn_amount); spawn_timer = 0
@@ -655,11 +703,8 @@ while True:
             shoot_timer -= 1
             if shoot_timer <= 0: 
                 is_shooting = False
-                # 🚀 사격 애니메이션(타이머)이 끝난 직후 총알이 0이면 자동 재장전 시작
-                if current_weapon == WEAPON_PISTOL and current_pistol_ammo == 0:
-                    start_reload()
-                elif current_weapon == WEAPON_AK and current_ak_ammo == 0 and ak_reserve_ammo > 0:
-                    start_reload()
+                if current_weapon == WEAPON_PISTOL and current_pistol_ammo == 0: start_reload()
+                elif current_weapon == WEAPON_AK and current_ak_ammo == 0 and ak_reserve_ammo > 0: start_reload()
             
         if not player_dead:
             aim_sens_modifier = 0.5 if is_aiming else 1.0
@@ -685,8 +730,7 @@ while True:
             check_collision(dx, dy)
             
             for item in items[:]:
-                dist = math.hypot(player_x - item['x'], player_y - item['y'])
-                if dist < 40: 
+                if math.hypot(player_x - item['x'], player_y - item['y']) < 40: 
                     if item['type'] == 'ak':
                         if not has_ak: has_ak = True; current_weapon = WEAPON_AK; heal_message = "AK-47 획득 (+30발)"
                         else: heal_message = "AK-47 탄약 획득 (+30발)"
@@ -729,7 +773,6 @@ while True:
         for depth in range(1, int(MAX_DEPTH), 8):
             test_x, test_y = player_x + cos_a * depth, player_y + sin_a * depth
             if not (0 <= test_x < MAP_W*TILE_SIZE and 0 <= test_y < MAP_H*TILE_SIZE): break
-                
             if MAP[int(test_y / TILE_SIZE)][int(test_x / TILE_SIZE)] == 1:
                 refined_depth = depth - 7
                 for _ in range(8):
@@ -755,50 +798,39 @@ while True:
     if game_state == STATE_PAUSED:
         overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA); overlay.fill((0, 0, 0, 180))
         virtual_screen.blit(overlay, (0, 0))
-        
-        # 🚀 UI 좌표들 깔끔하게 분배
         pause_text = GO_FONT.render("일시정지", True, WHITE)
         virtual_screen.blit(pause_text, (WIDTH//2 - pause_text.get_width()//2, 50))
-        
         sens_label = DMG_FONT.render("마우스 감도 설정", True, WHITE)
         virtual_screen.blit(sens_label, (WIDTH//2 - sens_label.get_width()//2, 170))
-        
-        mouse_x, mouse_y = pygame.mouse.get_pos()
-        virtual_mouse_pos = get_virtual_mouse_pos(mouse_x, mouse_y)
+        virtual_mouse_pos = get_virtual_mouse_pos(*pygame.mouse.get_pos())
         
         minus_color = LIGHT_GRAY if sens_minus_btn_rect.collidepoint(virtual_mouse_pos) else GRAY
         plus_color = LIGHT_GRAY if sens_plus_btn_rect.collidepoint(virtual_mouse_pos) else GRAY
         reset_color = LIGHT_GRAY if sens_reset_btn_rect.collidepoint(virtual_mouse_pos) else GRAY
-        
         pygame.draw.rect(virtual_screen, minus_color, sens_minus_btn_rect, border_radius=5)
         pygame.draw.rect(virtual_screen, plus_color, sens_plus_btn_rect, border_radius=5)
         pygame.draw.rect(virtual_screen, reset_color, sens_reset_btn_rect, border_radius=5)
         
         minus_text, plus_text = PROG_FONT.render("-", True, WHITE), PROG_FONT.render("+", True, WHITE)
         reset_text = DMG_FONT.render("초기화", True, WHITE)
-        
         virtual_screen.blit(minus_text, (sens_minus_btn_rect.centerx - minus_text.get_width()//2, sens_minus_btn_rect.centery - minus_text.get_height()//2))
         virtual_screen.blit(plus_text, (sens_plus_btn_rect.centerx - plus_text.get_width()//2, sens_plus_btn_rect.centery - plus_text.get_height()//2))
         virtual_screen.blit(reset_text, (sens_reset_btn_rect.centerx - reset_text.get_width()//2, sens_reset_btn_rect.centery - reset_text.get_height()//2))
-        
         sens_val_text = PROG_FONT.render(f"{sens_mult:.1f} x", True, YELLOW)
-        virtual_screen.blit(sens_val_text, (WIDTH//2 - sens_val_text.get_width()//2, 220)) # 버튼들과 Y축 맞춤
+        virtual_screen.blit(sens_val_text, (WIDTH//2 - sens_val_text.get_width()//2, 220))
         
         resume_color = (80, 80, 80) if resume_btn_rect.collidepoint(virtual_mouse_pos) else (50, 50, 50)
         restart_color = (80, 80, 150) if restart_btn_rect.collidepoint(virtual_mouse_pos) else (50, 50, 100)
         quit_color = (200, 50, 50) if quit_btn_rect.collidepoint(virtual_mouse_pos) else (150, 0, 0)
-        
         pygame.draw.rect(virtual_screen, resume_color, resume_btn_rect, border_radius=10)
         pygame.draw.rect(virtual_screen, restart_color, restart_btn_rect, border_radius=10)
         pygame.draw.rect(virtual_screen, quit_color, quit_btn_rect, border_radius=10)
-        
         pygame.draw.rect(virtual_screen, WHITE, resume_btn_rect, 3, border_radius=10)
         pygame.draw.rect(virtual_screen, WHITE, restart_btn_rect, 3, border_radius=10)
         pygame.draw.rect(virtual_screen, WHITE, quit_btn_rect, 3, border_radius=10)
         
         resume_text, restart_btn_txt = PROG_FONT.render("게임 재개", True, WHITE), PROG_FONT.render("다시시작", True, WHITE)
         quit_text = PROG_FONT.render("게임 종료", True, WHITE)
-        
         virtual_screen.blit(resume_text, (resume_btn_rect.centerx - resume_text.get_width()//2, resume_btn_rect.centery - resume_text.get_height()//2))
         virtual_screen.blit(restart_btn_txt, (restart_btn_rect.centerx - restart_btn_txt.get_width()//2, restart_btn_rect.centery - restart_btn_txt.get_height()//2))
         virtual_screen.blit(quit_text, (quit_btn_rect.centerx - quit_text.get_width()//2, quit_btn_rect.centery - quit_text.get_height()//2))
@@ -808,10 +840,8 @@ while True:
         virtual_screen.blit(overlay, (0,0))
         died_text = GO_FONT.render("사망했습니다", True, RED)
         virtual_screen.blit(died_text, (WIDTH//2 - died_text.get_width()//2, HEIGHT//2 - died_text.get_height()//2 - 50))
-        
         final_score_text = PROG_FONT.render(f"최종 점수: {current_score}", True, WHITE)
         virtual_screen.blit(final_score_text, (WIDTH//2 - final_score_text.get_width()//2, HEIGHT//2 + 50))
-        
         restart_text = PROG_FONT.render("아무 키나 눌러 재시작", True, GREEN)
         if pygame.time.get_ticks() % 1000 < 600:
             virtual_screen.blit(restart_text, (WIDTH//2 - restart_text.get_width()//2, HEIGHT//2 + 100))
@@ -819,11 +849,9 @@ while True:
     win_w, win_h = screen.get_size()
     ratio = min(win_w / WIDTH, win_h / HEIGHT)
     scaled_w, scaled_h = int(WIDTH * ratio), int(HEIGHT * ratio)
-    
     scaled_surf = pygame.transform.scale(virtual_screen, (scaled_w, scaled_h))
     
     screen.fill(BLACK) 
     screen.blit(scaled_surf, ((win_w - scaled_w) // 2, (win_h - scaled_h) // 2))
-    
     pygame.display.flip()
     clock.tick(60)
