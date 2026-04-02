@@ -1,0 +1,80 @@
+import socket
+import threading
+import time
+
+# 항상 1P와 2P의 좌표 및 타격 이벤트(hits) 관리
+players = {
+    1: {"x": -100.0, "y": -100.0, "hits": ""},
+    2: {"x": -100.0, "y": -100.0, "hits": ""}
+}
+clients = []
+
+def handle_client(conn, p_id):
+    global players
+    # 홀수면 1P, 짝수면 2P로 강제 역할 부여
+    my_role = 1 if p_id % 2 != 0 else 2 
+    
+    try:
+        conn.sendall(f"{my_role}\n".encode('utf-8'))
+        time.sleep(0.1)
+
+        while True:
+            data = conn.recv(1024).decode('utf-8')
+            if not data: break
+
+            messages = data.strip().split('\n')
+            if messages and messages[-1]:
+                try:
+                    # 1. 데이터 포맷 파싱: x,y/hit_events
+                    parts = messages[-1].split('/')
+                    x_str, y_str = parts[0].split(',')
+                    players[my_role]["x"] = float(x_str)
+                    players[my_role]["y"] = float(y_str)
+                    
+                    # 타격 이벤트가 포함되어 있으면 저장
+                    players[my_role]["hits"] = parts[1] if len(parts) > 1 else ""
+                except Exception as e:
+                    pass
+
+            # 2. 두 플레이어의 좌표 및 타격 이벤트를 함께 묶어서 중계
+            # 포맷: p1_x,p1_y/p1_hits|p2_x,p2_y/p2_hits
+            p1_hits = players.get(1, {}).get("hits", "")
+            p2_hits = players.get(2, {}).get("hits", "")
+            
+            state_msg = f"{players[1]['x']},{players[1]['y']}/{p1_hits}|{players[2]['x']},{players[2]['y']}/{p2_hits}\n"
+            conn.sendall(state_msg.encode('utf-8'))
+
+    except Exception as e:
+        pass
+
+    print(f"[알림] 접속 종료 (역할: {my_role}P)")
+    if conn in clients:
+        clients.remove(conn)
+    conn.close()
+
+def start_server():
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(('0.0.0.0', 5555))
+    server.listen(5)
+    print("=== 멀티플레이 동기화 서버 실행 중 (포트 5555) ===")
+
+    p_count = 0
+    while True:
+        try:
+            conn, addr = server.accept()
+            p_count += 1
+            clients.append(conn)
+            print(f"[알림] {addr} 접속됨 (부여된 ID: {p_count})")
+            
+            thread = threading.Thread(target=handle_client, args=(conn, p_count))
+            thread.daemon = True
+            thread.start()
+        except KeyboardInterrupt:
+            print("서버를 종료합니다.")
+            break
+        except Exception as e:
+            print(f"서버 오류: {e}")
+
+if __name__ == "__main__":
+    start_server()
