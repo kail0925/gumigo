@@ -1,0 +1,39 @@
+def shoot():
+    # ... (생략: 위쪽 변수 선언, 오디오 재생, 타겟 찾기 로직 등) ...
+
+    if target_enemy:
+        max_dmg_dist = 600.0
+        distance_ratio = min(min_dist / max_dmg_dist, 1.0)
+        damage_multiplier = 1.0 - (0.8 * distance_ratio) 
+        final_base_damage = base_damage * damage_multiplier
+        damage = int(final_base_damage * 1.5) if is_headshot else int(final_base_damage)
+        
+        # -----------------------------------------------------------------
+        # [여기서부터 수정 3번을 적용하세요!]
+        # -----------------------------------------------------------------
+        # 기존: target_enemy['hp'] -= damage
+        target_enemy['hp'] -= damage
+        
+        # [추가] 멀티플레이 동기화를 위해 맞춘 몬스터 인덱스와 데미지 기록
+        try:
+            enemy_idx = enemies.index(target_enemy)
+            pending_hits.append(f"{enemy_idx}:{damage}")
+        except ValueError:
+            pass # 리스트에 없는 몬스터인 경우 예외처리
+
+        # 기존: 몬스터 사망 처리 로직
+        if target_enemy['hp'] <= 0 and not target_enemy['dead']:
+            target_enemy['dead'] = True
+            global current_score # <- 기존 코드에 global current_score 선언이 필요할 수 있습니다.
+            current_score += 100 
+        # -----------------------------------------------------------------
+
+        offset_x, offset_y = random.randint(-30, 30), random.randint(-30, 0)
+        hit_effects.append({
+            'pos': (screen_x + offset_x, HEIGHT // 2 + offset_y),
+            'timer': hit_effect_duration,
+            'is_headshot': is_headshot,
+            'damage': damage
+        })
+        return True
+    return False
