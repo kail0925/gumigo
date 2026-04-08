@@ -1,0 +1,579 @@
+"""
+doom_server_updated.py  –  RETRO FPS 멀티플레이 서버 (doom.txt 최신판 대응)
+방장(호스트)이 이 파일을 실행하면 됩니다.
+클라이언트는 doom_multiplayer_updated.py 를 실행하고 이 서버의 IP 를 입력하면 접속됩니다.
+
+사용법:
+    python3 doom_server_updated.py [포트]   (기본 포트: 55555)
+"""
+
+import socket
+import threading
+import json
+import math
+import random
+import time
+import sys
+import collections
+
+PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 55555
+TICK_RATE = 20
+TILE_SIZE = 64
+MAP_W, MAP_H = 24, 24
+
+clients = {}
+clients_lock = threading.Lock()
+
+enemies = []
+items = []
+bullet_holes = []
+MAP = []
+game_started = False
+spawn_timer = 0
+flow_field_cache = {}
+
+
+def generate_random_map(w, h):
+    global MAP
+    MAP = [[1 for _ in range(w)] for _ in range(h)]
+    for y in range(1, h - 1):
+        for x in range(1, w - 1):
+            if random.random() > 0.3:
+                MAP[y][x] = 0
+    cx, cy = w // 2, h // 2
+    for dy in range(-1, 2):
+        for dx in range(-1, 2):
+            MAP[cy + dy][cx + dx] = 0
+
+    visited = set()
+    regions = []
+    for y in range(1, h - 1):
+        for x in range(1, w - 1):
+            if MAP[y][x] == 0 and (x, y) not in visited:
+                region = []
+                q = [(x, y)]
+                visited.add((x, y))
+                while q:
+                    curr_x, curr_y = q.pop(0)
+                    region.append((curr_x, curr_y))
+                    for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                        nx, ny = curr_x + dx, curr_y + dy
+                        if 0 < nx < w - 1 and 0 < ny < h - 1 and MAP[ny][nx] == 0 and (nx, ny) not in visited:
+                            visited.add((nx, ny))
+                            q.append((nx, ny))
+                regions.append(region)
+
+    if regions:
+        regions.sort(key=len, reverse=True)
+        main_region = regions[0]
+        for isolated_region in regions[1:]:
+            r1_x, r1_y = random.choice(isolated_region)
+            r2_x, r2_y = random.choice(main_region)
+            if random.choice([True, False]):
+                for x in range(min(r1_x, r2_x), max(r1_x, r2_x) + 1):
+                    MAP[r1_y][x] = 0
+                for y in range(min(r1_y, r2_y), max(r1_y, r2_y) + 1):
+                    MAP[y][r2_x] = 0
+            else:
+                for y in range(min(r1_y, r2_y), max(r1_y, r2_y) + 1):
+                    MAP[y][r1_x] = 0
+                for x in range(min(r1_x, r2_x), max(r1_x, r2_x) + 1):
+                    MAP[r2_y][x] = 0
+
+    for _ in range(2):
+        for y in range(h - 1):
+            for x in range(w - 1):
+                if MAP[y][x] == 1 and MAP[y + 1][x + 1] == 1:
+                    if MAP[y + 1][x] == 0 and MAP[y][x + 1] == 0:
+                        MAP[y + 1][x] = 1
+                        MAP[y][x + 1] = 1
+                if MAP[y][x + 1] == 1 and MAP[y + 1][x] == 1:
+                    if MAP[y][x] == 0 and MAP[y + 1][x + 1] == 0:
+                        MAP[y][x] = 1
+                        MAP[y + 1][x + 1] = 1
+
+
+def check_line_of_sight(x1, y1, x2, y2):
+    dx = x2 - x1
+    dy = y2 - y1
+    dist = math.hypot(dx, dy)
+    if dist == 0:
+        return True
+
+    steps = int(dist / 16.0)
+    if steps == 0:
+        return True
+
+    for i in range(1, steps):
+        chk_x = x1 + (dx * i / steps)
+        chk_y = y1 + (dy * i / steps)
+        grid_x, grid_y = int(chk_x / TILE_SIZE), int(chk_y / TILE_SIZE)
+        if 0 <= grid_x < MAP_W and 0 <= grid_y < MAP_H and MAP[grid_y][grid_x] == 1:
+            return False
+    return True
+
+
+def clear_flow_field_cache():
+    flow_field_cache.clear()
+
+
+def build_flow_field(target_x, target_y):
+    px, py = int(target_x / TILE_SIZE), int(target_y / TILE_SIZE)
+    if not (0 <= px < MAP_W and 0 <= py < MAP_H):
+        return [[(0, 0)] * MAP_W for _ in range(MAP_H)]
+
+    integration_field = [[float('inf')] * MAP_W for _ in range(MAP_H)]
+    flow_field = [[(0, 0)] * MAP_W for _ in range(MAP_H)]
+    directions = [(0, -1), (0, 1), (-1, 0), (1, 0), (-1, -1), (1, -1), (-1, 1), (1, 1)]
+
+    queue = collections.deque([(px, py)])
+    integration_field[py][px] = 0
+
+    while queue:
+        cx, cy = queue.popleft()
+        for dx, dy in directions:
+            nx, ny = cx + dx, cy + dy
+            if 0 <= nx < MAP_W and 0 <= ny < MAP_H and MAP[ny][nx] == 0:
+                cost = 1.414 if dx != 0 and dy != 0 else 1.0
+                new_cost = integration_field[cy][cx] + cost
+                if new_cost < integration_field[ny][nx]:
+                    integration_field[ny][nx] = new_cost
+                    queue.append((nx, ny))
+
+    for y in range(MAP_H):
+        for x in range(MAP_W):
+            if MAP[y][x] == 1:
+                continue
+            if integration_field[y][x] == float('inf'):
+                flow_field[y][x] = (0, 0)
+                continue
+
+            left = integration_field[y][x - 1] if x > 0 and MAP[y][x - 1] == 0 else integration_field[y][x]
+            right = integration_field[y][x + 1] if x < MAP_W - 1 and MAP[y][x + 1] == 0 else integration_field[y][x]
+            up = integration_field[y - 1][x] if y > 0 and MAP[y - 1][x] == 0 else integration_field[y][x]
+            down = integration_field[y + 1][x] if y < MAP_H - 1 and MAP[y + 1][x] == 0 else integration_field[y][x]
+
+            vx = left - right
+            vy = up - down
+
+            if vx == 0 and vy == 0:
+                min_cost = float('inf')
+                best_dir = (0, 0)
+                for dx, dy in directions:
+                    nx, ny = x + dx, y + dy
+                    if 0 <= nx < MAP_W and 0 <= ny < MAP_H and MAP[ny][nx] == 0 and integration_field[ny][nx] < min_cost:
+                        min_cost = integration_field[ny][nx]
+                        dist = math.hypot(dx, dy)
+                        best_dir = (dx / dist, dy / dist)
+                flow_field[y][x] = best_dir
+            else:
+                v_len = math.hypot(vx, vy)
+                flow_field[y][x] = (vx / v_len, vy / v_len) if v_len > 0 else (0, 0)
+
+    return flow_field
+
+
+def is_safe_enemy(target_x, target_y):
+    if math.isnan(target_x) or math.isnan(target_y):
+        return False
+    margin = 8
+    for dx in [-margin, margin]:
+        for dy in [-margin, margin]:
+            check_x = int((target_x + dx) / TILE_SIZE)
+            check_y = int((target_y + dy) / TILE_SIZE)
+            if check_x < 0 or check_x >= MAP_W or check_y < 0 or check_y >= MAP_H:
+                return False
+            if MAP[check_y][check_x] != 0:
+                return False
+    return True
+
+
+def spawn_enemies(count):
+    global enemies
+    cx, cy = MAP_W // 2, MAP_H // 2
+    px, py = cx * TILE_SIZE + TILE_SIZE // 2, cy * TILE_SIZE + TILE_SIZE // 2
+    existing_ids = {e.get('id') for e in enemies if 'id' in e}
+    for _ in range(count):
+        for _ in range(50):
+            gx = random.randint(1, MAP_W - 2)
+            gy = random.randint(1, MAP_H - 2)
+            dist = math.hypot(gx * TILE_SIZE - px, gy * TILE_SIZE - py)
+            if MAP[gy][gx] == 0 and dist > 300:
+                enemy_id = random.randint(0, 999999)
+                while enemy_id in existing_ids:
+                    enemy_id = random.randint(0, 999999)
+                existing_ids.add(enemy_id)
+                enemies.append({
+                    'id': enemy_id,
+                    'x': gx * TILE_SIZE + TILE_SIZE // 2,
+                    'y': gy * TILE_SIZE + TILE_SIZE // 2,
+                    'hp': 150,
+                    'speed': random.uniform(0.6, 1.4),
+                    'dead': False,
+                    'next_attack': 0,
+                    'anim_offset': random.uniform(0, math.pi * 2),
+                    'walk_dist': 0  # 발소리 거리 추적용 변수 추가
+                })
+                break
+
+
+def init_game_state():
+    global enemies, items, bullet_holes, game_started, spawn_timer
+    enemies = []
+    items = []
+    bullet_holes = []
+    spawn_timer = 0
+    clear_flow_field_cache()
+    generate_random_map(MAP_W, MAP_H)
+    spawn_enemies(10)
+    game_started = True
+    print('[서버] 게임 상태 초기화 완료')
+
+
+def update_enemies():
+    global enemies, spawn_timer
+    now = time.time() * 1000
+
+    with clients_lock:
+        alive_players = [(c['x'], c['y'], addr) for addr, c in clients.items() if not c.get('dead', False)]
+
+    if not alive_players:
+        return
+
+    for enemy in enemies:
+        if enemy['dead']:
+            continue
+
+        min_dist = float('inf')
+        target_px, target_py, target_addr = alive_players[0]
+        for px, py, addr in alive_players:
+            d = math.hypot(enemy['x'] - px, enemy['y'] - py)
+            if d < min_dist:
+                min_dist = d
+                target_px, target_py, target_addr = px, py, addr
+
+        edx = target_px - enemy['x']
+        edy = target_py - enemy['y']
+        dist = math.hypot(edx, edy)
+
+        if dist > 35:
+            if check_line_of_sight(enemy['x'], enemy['y'], target_px, target_py):
+                fdx, fdy = edx / max(1.0, dist), edy / max(1.0, dist)
+            else:
+                cache_key = (int(target_px / TILE_SIZE), int(target_py / TILE_SIZE))
+                if cache_key not in flow_field_cache:
+                    flow_field_cache[cache_key] = build_flow_field(target_px, target_py)
+                flow_field = flow_field_cache[cache_key]
+                grid_x = int(enemy['x'] / TILE_SIZE)
+                grid_y = int(enemy['y'] / TILE_SIZE)
+                if 0 <= grid_x < MAP_W and 0 <= grid_y < MAP_H:
+                    fdx, fdy = flow_field[grid_y][grid_x]
+                    if fdx == 0 and fdy == 0:
+                        fdx, fdy = edx / max(1.0, dist), edy / max(1.0, dist)
+                else:
+                    fdx, fdy = edx / max(1.0, dist), edy / max(1.0, dist)
+
+            move_x = fdx * enemy['speed']
+            move_y = fdy * enemy['speed']
+            
+            # --- 몬스터 이동 및 발소리 처리 ---
+            moved = False
+            if is_safe_enemy(enemy['x'] + move_x, enemy['y']):
+                enemy['x'] += move_x
+                moved = True
+            if is_safe_enemy(enemy['x'], enemy['y'] + move_y):
+                enemy['y'] += move_y
+                moved = True
+                
+            if moved:
+                enemy['walk_dist'] = enemy.get('walk_dist', 0) + math.hypot(move_x, move_y)
+                if enemy['walk_dist'] > 80:  # 약 80픽셀 단위로 발소리 발생
+                    enemy['walk_dist'] = 0
+                    broadcast({'type': 'play_sound', 'sound': 'monster_footstep', 'x': enemy['x'], 'y': enemy['y']})
+            # ----------------------------------
+            
+        else:
+            if now >= enemy['next_attack']:
+                enemy['next_attack'] = now + 1000
+                with clients_lock:
+                    if target_addr in clients:
+                        try:
+                            msg = json.dumps({'type': 'hit', 'damage': 10}) + '\n'
+                            clients[target_addr]['conn'].sendall(msg.encode())
+                        except Exception:
+                            pass
+
+    if len(flow_field_cache) > 32:
+        alive_target_cells = {
+            (int(px / TILE_SIZE), int(py / TILE_SIZE))
+            for px, py, _ in alive_players
+        }
+        for key in list(flow_field_cache.keys()):
+            if key not in alive_target_cells:
+                flow_field_cache.pop(key, None)
+
+    total_score = 0
+    with clients_lock:
+        for c in clients.values():
+            total_score += c.get('score', 0)
+
+    target_max = min(30, 10 + (total_score // 600) * 2)
+    spawn_amount = min(3, 1 + (total_score // 1200))
+    spawn_delay_ticks = max(60, 150 - (total_score // 300) * 5)
+
+    alive_count = sum(1 for e in enemies if not e['dead'])
+    if len(enemies) > target_max * 2:
+        enemies[:] = [e for e in enemies if not e['dead']]
+    if alive_count < target_max:
+        spawn_timer += 1
+        if spawn_timer > spawn_delay_ticks:
+            spawn_enemies(spawn_amount)
+            spawn_timer = 0
+
+
+def drop_item_from_enemy(enemy, player_state=None):
+    r = random.random()
+    has_ak = bool(player_state.get('has_ak', False)) if player_state else False
+    has_shotgun = bool(player_state.get('has_shotgun', False)) if player_state else False
+    drop_type = None
+
+    if r < 0.15:
+        drop_type = 'shotgun_ammo' if has_shotgun else 'shotgun'
+    elif r < 0.40:
+        drop_type = 'ak_ammo' if has_ak else 'ak'
+    elif r < 0.60:
+        drop_type = 'health'
+
+    if drop_type:
+        items.append({
+            'id': random.randint(0, 999999),
+            'x': enemy['x'] + random.randint(-10, 10),
+            'y': enemy['y'] + random.randint(-10, 10),
+            'type': drop_type,
+            'anim': random.random() * 10,
+        })
+
+
+def handle_client(conn, addr):
+    addr_key = f"{addr[0]}:{addr[1]}"
+    cx, cy = MAP_W // 2, MAP_H // 2
+    spawn_x = cx * TILE_SIZE + TILE_SIZE // 2
+    spawn_y = cy * TILE_SIZE + TILE_SIZE // 2
+
+    with clients_lock:
+        clients[addr_key] = {
+            'conn': conn,
+            'pid': addr_key,
+            'x': spawn_x,
+            'y': spawn_y,
+            'angle': math.pi / 2,
+            'hp': 100.0,
+            'score': 0,
+            'weapon': 0,
+            'dead': False,
+            'has_ak': False,
+            'has_shotgun': False,
+            'pistol_ammo': 6,
+            'ak_ammo': 30,
+            'ak_reserve': 30,
+            'sg_ammo': 4,
+            'sg_reserve': 4,
+        }
+
+    print(f"[서버] 클라이언트 접속: {addr_key}")
+
+    init_msg = {
+        'type': 'init',
+        'pid': addr_key,
+        'map': MAP,
+        'map_w': MAP_W,
+        'map_h': MAP_H,
+        'spawn_x': spawn_x,
+        'spawn_y': spawn_y,
+        'enemies': enemies,
+        'items': items,
+    }
+    try:
+        conn.sendall((json.dumps(init_msg) + '\n').encode())
+    except Exception as e:
+        print(f"[서버] init 전송 실패: {e}")
+        conn.close()
+        with clients_lock:
+            clients.pop(addr_key, None)
+        return
+
+    buf = ''
+    try:
+        while True:
+            data = conn.recv(4096)
+            if not data:
+                break
+            buf += data.decode('utf-8', errors='ignore')
+            while '\n' in buf:
+                line, buf = buf.split('\n', 1)
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                    process_client_msg(addr_key, msg)
+                except json.JSONDecodeError:
+                    pass
+    except Exception as e:
+        print(f"[서버] 클라이언트 오류 {addr_key}: {e}")
+    finally:
+        conn.close()
+        with clients_lock:
+            clients.pop(addr_key, None)
+        print(f"[서버] 클라이언트 연결 종료: {addr_key}")
+
+
+def process_client_msg(addr_key, msg):
+    mtype = msg.get('type')
+
+    if mtype == 'state':
+        with clients_lock:
+            if addr_key in clients:
+                c = clients[addr_key]
+                c['x'] = msg.get('x', c['x'])
+                c['y'] = msg.get('y', c['y'])
+                c['angle'] = msg.get('angle', c['angle'])
+                c['hp'] = msg.get('hp', c['hp'])
+                c['score'] = msg.get('score', c['score'])
+                c['weapon'] = msg.get('weapon', c['weapon'])
+                c['dead'] = msg.get('dead', c['dead'])
+                c['has_ak'] = msg.get('has_ak', c.get('has_ak', False))
+                c['has_shotgun'] = msg.get('has_shotgun', c.get('has_shotgun', False))
+                c['pistol_ammo'] = msg.get('pistol_ammo', c.get('pistol_ammo', 6))
+                c['ak_ammo'] = msg.get('ak_ammo', c.get('ak_ammo', 30))
+                c['ak_reserve'] = msg.get('ak_reserve', c.get('ak_reserve', 30))
+                c['sg_ammo'] = msg.get('sg_ammo', c.get('sg_ammo', 4))
+                c['sg_reserve'] = msg.get('sg_reserve', c.get('sg_reserve', 4))
+
+    elif mtype == 'shoot':
+        enemy_id = msg.get('enemy_id')
+        damage = msg.get('damage', 0)
+        is_headshot = msg.get('headshot', False)
+        with clients_lock:
+            player_state = dict(clients.get(addr_key, {}))
+        for enemy in enemies:
+            if enemy['id'] == enemy_id and not enemy['dead']:
+                enemy['hp'] -= damage
+                if enemy['hp'] <= 0:
+                    enemy['dead'] = True
+                    drop_item_from_enemy(enemy, player_state)
+                    score_gain = 200 if is_headshot else 100
+                    with clients_lock:
+                        if addr_key in clients:
+                            clients[addr_key]['score'] = clients[addr_key].get('score', 0) + score_gain
+                    broadcast({'type': 'enemy_killed', 'enemy_id': enemy_id, 'by': addr_key, 'score': score_gain})
+                else:
+                    broadcast({'type': 'enemy_hp', 'enemy_id': enemy_id, 'hp': enemy['hp']})
+                break
+
+    elif mtype == 'pickup':
+        item_id = msg.get('item_id')
+        for item in items[:]:
+            if item['id'] == item_id:
+                items.remove(item)
+                broadcast({'type': 'item_removed', 'item_id': item_id})
+                break
+
+    elif mtype == 'bullet_hole':
+        bullet_holes.append(msg.get('hole', {}))
+        if len(bullet_holes) > 200:
+            bullet_holes.pop(0)
+
+    elif mtype == 'respawn':
+        with clients_lock:
+            if addr_key in clients:
+                cx2, cy2 = MAP_W // 2, MAP_H // 2
+                clients[addr_key]['x'] = cx2 * TILE_SIZE + TILE_SIZE // 2
+                clients[addr_key]['y'] = cy2 * TILE_SIZE + TILE_SIZE // 2
+                clients[addr_key]['hp'] = 100.0
+                clients[addr_key]['dead'] = False
+
+    # --- 클라이언트 간 사운드 공유 (장전 소리 및 발소리 중계) ---
+    elif mtype == 'play_sound':
+        broadcast(msg, exclude=addr_key)
+
+
+def broadcast(msg, exclude=None):
+    data = (json.dumps(msg) + '\n').encode()
+    with clients_lock:
+        for addr_key, c in list(clients.items()):
+            if addr_key == exclude:
+                continue
+            try:
+                c['conn'].sendall(data)
+            except Exception:
+                pass
+
+
+def server_tick_loop():
+    interval = 1.0 / TICK_RATE
+    while True:
+        start = time.time()
+        if game_started:
+            update_enemies()
+            with clients_lock:
+                players_snapshot = [
+                    {
+                        'pid': c['pid'],
+                        'x': c['x'], 'y': c['y'],
+                        'angle': c['angle'],
+                        'hp': c['hp'],
+                        'score': c['score'],
+                        'weapon': c['weapon'],
+                        'dead': c['dead'],
+                    }
+                    for c in clients.values()
+                ]
+
+            world_msg = {
+                'type': 'world',
+                'players': players_snapshot,
+                'enemies': [
+                    {'id': e['id'], 'x': e['x'], 'y': e['y'], 'hp': e['hp'], 'dead': e['dead'], 'anim_offset': e['anim_offset']}
+                    for e in enemies
+                ],
+                'items': [
+                    {'id': i['id'], 'x': i['x'], 'y': i['y'], 'type': i['type'], 'anim': i['anim']}
+                    for i in items
+                ],
+            }
+            broadcast(world_msg)
+
+        elapsed = time.time() - start
+        sleep_time = interval - elapsed
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+
+
+def main():
+    init_game_state()
+
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_sock.bind(('0.0.0.0', PORT))
+    server_sock.listen(8)
+    print(f"[서버] RETRO FPS 멀티플레이 서버 시작 – 포트 {PORT}")
+    print('[서버] 클라이언트는 이 PC의 IP 주소를 입력하면 접속됩니다.')
+    print('[서버] 종료하려면 Ctrl+C 를 누르세요.')
+
+    tick_thread = threading.Thread(target=server_tick_loop, daemon=True)
+    tick_thread.start()
+
+    try:
+        while True:
+            conn, addr = server_sock.accept()
+            t = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
+            t.start()
+    except KeyboardInterrupt:
+        print('\n[서버] 종료합니다.')
+    finally:
+        server_sock.close()
+
+
+if __name__ == '__main__':
+    main()
